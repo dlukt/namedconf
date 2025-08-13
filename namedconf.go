@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -14,6 +15,7 @@ type Config struct {
 	Options    Options            `json:"options"`
 	ACLs       []ACL              `json:"acls"`
 	Keys       []Key              `json:"keys"`
+	TLS        []TLSConfig        `json:"tls"`
 	Logging    *Logging           `json:"logging,omitempty"`
 	Controls   *Controls          `json:"controls,omitempty"`
 	Includes   []string           `json:"includes"`
@@ -24,35 +26,66 @@ type Config struct {
 	Unknown    []UnknownStatement `json:"unknown"`
 }
 
+// TLSConfig represents a TLS configuration block
+type TLSConfig struct {
+	Name     string `json:"name"`
+	CertFile string `json:"cert_file"`
+	KeyFile  string `json:"key_file"`
+}
+
+// ListenOn represents a listen-on configuration
+type ListenOn struct {
+	Port      int      `json:"port"`
+	TLS       string   `json:"tls,omitempty"`
+	HTTP      string   `json:"http,omitempty"`
+	Addresses []string `json:"addresses"`
+}
+
 // Zone represents a zone configuration
 type Zone struct {
-	Name     string            `json:"name"`
-	Type     string            `json:"type"`
-	File     string            `json:"file,omitempty"`
-	Masters  []string          `json:"masters,omitempty"`
-	Options  map[string]string `json:"options"`
-	Comments []string          `json:"comments,omitempty"`
+	Name          string            `json:"name"`
+	Type          string            `json:"type"`
+	File          string            `json:"file,omitempty"`
+	Masters       []string          `json:"masters,omitempty"`
+	Notify        *bool             `json:"notify,omitempty"`
+	DNSSECPolicy  string            `json:"dnssec_policy,omitempty"`
+	InlineSigning *bool             `json:"inline_signing,omitempty"`
+	AllowTransfer []string          `json:"allow_transfer,omitempty"`
+	Options       map[string]string `json:"options"`
+	Comments      []string          `json:"comments,omitempty"`
 }
 
 // Options represents the global options block
 type Options struct {
-	Directory        string            `json:"directory,omitempty"`
-	PidFile          string            `json:"pid_file,omitempty"`
-	Listen           []string          `json:"listen,omitempty"`
-	QuerySource      string            `json:"query_source,omitempty"`
-	Forwarders       []string          `json:"forwarders,omitempty"`
-	Forward          string            `json:"forward,omitempty"`
-	Recursion        *bool             `json:"recursion,omitempty"`
-	AllowQuery       []string          `json:"allow_query,omitempty"`
-	AllowTransfer    []string          `json:"allow_transfer,omitempty"`
-	AllowRecursion   []string          `json:"allow_recursion,omitempty"`
-	Version          string            `json:"version,omitempty"`
-	Hostname         string            `json:"hostname,omitempty"`
-	ServerID         string            `json:"server_id,omitempty"`
-	NotifySource     string            `json:"notify_source,omitempty"`
-	TransferSource   string            `json:"transfer_source,omitempty"`
-	DNSSECValidation string            `json:"dnssec_validation,omitempty"`
-	Additional       map[string]string `json:"additional"`
+	Directory            string            `json:"directory,omitempty"`
+	PidFile              string            `json:"pid_file,omitempty"`
+	ListenOn             []ListenOn        `json:"listen_on,omitempty"`
+	ListenOnV6           []ListenOn        `json:"listen_on_v6,omitempty"`
+	QuerySource          string            `json:"query_source,omitempty"`
+	Forwarders           []string          `json:"forwarders,omitempty"`
+	Forward              string            `json:"forward,omitempty"`
+	Recursion            *bool             `json:"recursion,omitempty"`
+	AllowQuery           []string          `json:"allow_query,omitempty"`
+	AllowQueryCache      []string          `json:"allow_query_cache,omitempty"`
+	AllowTransfer        []string          `json:"allow_transfer,omitempty"`
+	AllowRecursion       []string          `json:"allow_recursion,omitempty"`
+	AllowNewZones        *bool             `json:"allow_new_zones,omitempty"`
+	AlsoNotify           []string          `json:"also_notify,omitempty"`
+	Version              string            `json:"version,omitempty"`
+	Hostname             string            `json:"hostname,omitempty"`
+	ServerID             string            `json:"server_id,omitempty"`
+	NotifySource         string            `json:"notify_source,omitempty"`
+	TransferSource       string            `json:"transfer_source,omitempty"`
+	DNSSECValidation     string            `json:"dnssec_validation,omitempty"`
+	DumpFile             string            `json:"dump_file,omitempty"`
+	StatisticsFile       string            `json:"statistics_file,omitempty"`
+	MemstatisticsFile    string            `json:"memstatistics_file,omitempty"`
+	SecrootsFile         string            `json:"secroots_file,omitempty"`
+	RecursingFile        string            `json:"recursing_file,omitempty"`
+	ManagedKeysDirectory string            `json:"managed_keys_directory,omitempty"`
+	GeoipDirectory       string            `json:"geoip_directory,omitempty"`
+	SessionKeyfile       string            `json:"session_keyfile,omitempty"`
+	Additional           map[string]string `json:"additional"`
 }
 
 // ACL represents an access control list
@@ -180,6 +213,7 @@ func (p *Parser) Parse() (*Config, error) {
 		Zones:    []Zone{},
 		ACLs:     []ACL{},
 		Keys:     []Key{},
+		TLS:      []TLSConfig{},
 		Includes: []string{},
 		Masters:  []Masters{},
 		Servers:  []Server{},
@@ -201,9 +235,44 @@ func (p *Parser) Parse() (*Config, error) {
 
 // nextLine reads the next non-empty, non-comment line
 func (p *Parser) nextLine() bool {
+	var content strings.Builder
+	inBlockComment := false
+
 	for p.scanner.Scan() {
 		p.line++
-		line := strings.TrimSpace(p.scanner.Text())
+		line := p.scanner.Text()
+
+		// Handle block comments (/* ... */)
+		for {
+			if inBlockComment {
+				if idx := strings.Index(line, "*/"); idx != -1 {
+					line = line[idx+2:]
+					inBlockComment = false
+				} else {
+					line = ""
+					break
+				}
+			} else {
+				if idx := strings.Index(line, "/*"); idx != -1 {
+					before := line[:idx]
+					after := line[idx+2:]
+					if endIdx := strings.Index(after, "*/"); endIdx != -1 {
+						line = before + after[endIdx+2:]
+					} else {
+						line = before
+						inBlockComment = true
+					}
+				} else {
+					break
+				}
+			}
+		}
+
+		if inBlockComment {
+			continue
+		}
+
+		line = strings.TrimSpace(line)
 
 		// Skip empty lines and full-line comments
 		if line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "#") {
@@ -224,11 +293,27 @@ func (p *Parser) nextLine() bool {
 			}
 		}
 
-		p.current = line
+		content.WriteString(line + " ")
+
+		// Check if we have a complete statement (ends with ; or })
+		trimmed := strings.TrimSpace(content.String())
+		if strings.HasSuffix(trimmed, ";") || strings.HasSuffix(trimmed, "}") ||
+			strings.Contains(trimmed, "{") {
+			p.current = trimmed
+			p.tokenize()
+			p.pos = 0
+			return true
+		}
+	}
+
+	// Handle any remaining content
+	if content.Len() > 0 {
+		p.current = strings.TrimSpace(content.String())
 		p.tokenize()
 		p.pos = 0
 		return true
 	}
+
 	return false
 }
 
@@ -322,6 +407,12 @@ func (p *Parser) parseStatement(config *Config) error {
 			return err
 		}
 		config.Keys = append(config.Keys, *key)
+	case "tls":
+		tls, err := p.parseTLS()
+		if err != nil {
+			return err
+		}
+		config.TLS = append(config.TLS, *tls)
 	case "logging":
 		logging, err := p.parseLogging()
 		if err != nil {
@@ -385,10 +476,18 @@ func (p *Parser) parseZone() (*Zone, error) {
 	// Remove quotes if present
 	zoneName = strings.Trim(zoneName, "\"")
 
-	// Optional class
-	class := p.peek()
-	if class != "{" && class != "in" && class != "IN" {
-		p.next() // consume class if present
+	// Optional class (IN, CH, HS, etc.)
+	nextToken := p.peek()
+	if nextToken != "{" {
+		// This could be a class - consume it
+		class := p.next()
+		// Common classes: IN, CH, HS
+		if strings.ToUpper(class) == "IN" || strings.ToUpper(class) == "CH" || strings.ToUpper(class) == "HS" {
+			// Valid class, continue to expect '{'
+		} else {
+			// Not a recognized class, might be something else - put it back
+			p.pos-- // step back
+		}
 	}
 
 	if p.next() != "{" {
@@ -420,18 +519,46 @@ func (p *Parser) parseZone() (*Zone, error) {
 			p.next()
 			zone.File = strings.Trim(p.next(), "\"")
 			p.expectSemicolon()
+		case "notify":
+			p.next()
+			val := p.next()
+			notify := val == "yes"
+			zone.Notify = &notify
+			p.expectSemicolon()
+		case "dnssec-policy":
+			p.next()
+			zone.DNSSECPolicy = p.next()
+			p.expectSemicolon()
+		case "inline-signing":
+			p.next()
+			val := p.next()
+			inlineSigning := val == "yes"
+			zone.InlineSigning = &inlineSigning
+			p.expectSemicolon()
+		case "allow-transfer":
+			p.next()
+			if p.next() != "{" {
+				return nil, fmt.Errorf("expected '{' after allow-transfer")
+			}
+			for {
+				addr := p.next()
+				if addr == "}" {
+					break
+				}
+				zone.AllowTransfer = append(zone.AllowTransfer, strings.Trim(addr, ";"))
+			}
+			p.expectSemicolon()
 		case "masters":
 			p.next()
 			if p.next() != "{" {
 				return nil, fmt.Errorf("expected '{' after masters")
 			}
-			for p.nextLine() {
-				master := p.peek()
+			for {
+				master := p.next()
 				if master == "}" {
-					p.next()
 					break
 				}
-				zone.Masters = append(zone.Masters, strings.Trim(p.next(), ";"))
+				zone.Masters = append(zone.Masters, strings.Trim(master, ";"))
 			}
 			p.expectSemicolon()
 		default:
@@ -473,24 +600,130 @@ func (p *Parser) parseOptions(options *Options) error {
 			p.next()
 			options.PidFile = strings.Trim(p.next(), "\"")
 			p.expectSemicolon()
-		case "listen-on":
+		case "listen-on", "listen-on-v6":
+			listenType := token
 			p.next()
-			// Skip optional port specification
+
+			listenOn := ListenOn{Port: 53} // default port
+
+			// Parse optional port
 			if p.peek() == "port" {
-				p.next() // port
-				p.next() // port number
+				p.next() // consume "port"
+				portStr := p.next()
+				if port, err := strconv.Atoi(portStr); err == nil {
+					listenOn.Port = port
+				}
 			}
+
+			// Parse optional TLS
+			if p.peek() == "tls" {
+				p.next() // consume "tls"
+				listenOn.TLS = p.next()
+			}
+
+			// Parse optional HTTP
+			if p.peek() == "http" {
+				p.next() // consume "http"
+				listenOn.HTTP = p.next()
+			}
+
+			// Parse addresses block
 			if p.next() != "{" {
 				return fmt.Errorf("expected '{' after listen-on")
 			}
+
 			for {
 				addr := p.next()
 				if addr == "}" {
 					break
 				}
-				options.Listen = append(options.Listen, strings.Trim(addr, ";"))
+				listenOn.Addresses = append(listenOn.Addresses, strings.Trim(addr, ";"))
+			}
+
+			if listenType == "listen-on" {
+				options.ListenOn = append(options.ListenOn, listenOn)
+			} else {
+				options.ListenOnV6 = append(options.ListenOnV6, listenOn)
 			}
 			p.expectSemicolon()
+		case "allow-new-zones":
+			p.next()
+			val := p.next()
+			allowNewZones := val == "yes"
+			options.AllowNewZones = &allowNewZones
+			p.expectSemicolon()
+		case "allow-query-cache":
+			p.next()
+			if p.next() != "{" {
+				return fmt.Errorf("expected '{' after allow-query-cache")
+			}
+			for {
+				entry := p.next()
+				if entry == "}" {
+					break
+				}
+				options.AllowQueryCache = append(options.AllowQueryCache, strings.Trim(entry, ";"))
+			}
+			p.expectSemicolon()
+		case "also-notify":
+			p.next()
+			if p.next() != "{" {
+				return fmt.Errorf("expected '{' after also-notify")
+			}
+			for {
+				entry := p.next()
+				if entry == "}" {
+					break
+				}
+				options.AlsoNotify = append(options.AlsoNotify, strings.Trim(entry, ";"))
+			}
+			p.expectSemicolon()
+		case "dump-file":
+			p.next()
+			options.DumpFile = strings.Trim(p.next(), "\"")
+			p.expectSemicolon()
+		case "statistics-file":
+			p.next()
+			options.StatisticsFile = strings.Trim(p.next(), "\"")
+			p.expectSemicolon()
+		case "memstatistics-file":
+			p.next()
+			options.MemstatisticsFile = strings.Trim(p.next(), "\"")
+			p.expectSemicolon()
+		case "secroots-file":
+			p.next()
+			options.SecrootsFile = strings.Trim(p.next(), "\"")
+			p.expectSemicolon()
+		case "recursing-file":
+			p.next()
+			options.RecursingFile = strings.Trim(p.next(), "\"")
+			p.expectSemicolon()
+		case "managed-keys-directory":
+			p.next()
+			options.ManagedKeysDirectory = strings.Trim(p.next(), "\"")
+			p.expectSemicolon()
+		case "geoip-directory":
+			p.next()
+			options.GeoipDirectory = strings.Trim(p.next(), "\"")
+			p.expectSemicolon()
+		case "session-keyfile":
+			p.next()
+			options.SessionKeyfile = strings.Trim(p.next(), "\"")
+			p.expectSemicolon()
+		case "allow-query":
+			p.next()
+			if p.next() != "{" {
+				return fmt.Errorf("expected '{' after allow-query")
+			}
+			for {
+				entry := p.next()
+				if entry == "}" {
+					break
+				}
+				options.AllowQuery = append(options.AllowQuery, strings.Trim(entry, ";"))
+			}
+			p.expectSemicolon()
+
 		case "forwarders":
 			p.next()
 			if p.next() != "{" {
@@ -607,6 +840,42 @@ func (p *Parser) parseKey() (*Key, error) {
 	}
 
 	return key, nil
+}
+
+// parseTLS parses a TLS configuration block
+func (p *Parser) parseTLS() (*TLSConfig, error) {
+	p.next() // consume "tls"
+
+	name := p.next()
+	if p.next() != "{" {
+		return nil, fmt.Errorf("expected '{' after tls name")
+	}
+
+	tls := &TLSConfig{Name: name}
+
+	for p.nextLine() {
+		token := p.peek()
+		if token == "}" {
+			p.next()
+			if p.peek() == ";" {
+				p.next()
+			}
+			break
+		}
+
+		switch token {
+		case "cert-file":
+			p.next()
+			tls.CertFile = strings.Trim(p.next(), "\"")
+			p.expectSemicolon()
+		case "key-file":
+			p.next()
+			tls.KeyFile = strings.Trim(p.next(), "\"")
+			p.expectSemicolon()
+		}
+	}
+
+	return tls, nil
 }
 
 // parseLogging parses the logging block (simplified)
@@ -852,6 +1121,13 @@ func ParseString(content string) (*Config, error) {
 func (c *Config) String() string {
 	var sb strings.Builder
 
+	if len(c.TLS) > 0 {
+		sb.WriteString(fmt.Sprintf("TLS Configurations: %d\n", len(c.TLS)))
+		for _, tls := range c.TLS {
+			sb.WriteString(fmt.Sprintf("  - %s (cert: %s, key: %s)\n", tls.Name, tls.CertFile, tls.KeyFile))
+		}
+	}
+
 	if len(c.Zones) > 0 {
 		sb.WriteString(fmt.Sprintf("Zones: %d\n", len(c.Zones)))
 		for _, zone := range c.Zones {
@@ -872,6 +1148,20 @@ func (c *Config) String() string {
 
 	if c.Options.Directory != "" {
 		sb.WriteString(fmt.Sprintf("Directory: %s\n", c.Options.Directory))
+	}
+
+	if len(c.Options.ListenOn) > 0 {
+		sb.WriteString(fmt.Sprintf("Listen-On Interfaces: %d\n", len(c.Options.ListenOn)))
+		for _, listen := range c.Options.ListenOn {
+			sb.WriteString(fmt.Sprintf("  - Port %d", listen.Port))
+			if listen.TLS != "" {
+				sb.WriteString(fmt.Sprintf(" (TLS: %s)", listen.TLS))
+			}
+			if listen.HTTP != "" {
+				sb.WriteString(fmt.Sprintf(" (HTTP: %s)", listen.HTTP))
+			}
+			sb.WriteString(fmt.Sprintf(" - %v\n", listen.Addresses))
+		}
 	}
 
 	return sb.String()
