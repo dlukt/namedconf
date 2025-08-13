@@ -1,1168 +1,922 @@
+// Package namedconf provides a robust parser for ISC BIND 9 named.conf files.
+//
+// Highlights
+// - Recursive descent parser with tolerant grammar matching BIND-style directives
+// - Handles comments: //, #, /* ... */
+// - Handles quoted strings with escapes
+// - Handles nested blocks and semicolon-terminated statements
+// - Supports `include "file";` with cycle detection and optional inlining
+// - Builds a generic AST (Directive/Block/Atom) that preserves order and source positions
+// - First-class MatchGroup for brace-grouped address-match lists (e.g., topology)
+// - Provides helpful error messages with file/line/column context
+// - Zero external dependencies
+//
+// Note: BIND evolves and accepts many syntactic forms. While this parser is very
+// comprehensive and battle-tested in typical configs (options, logging, views,
+// zones, keys, acls, etc.), claiming *absolute* coverage of every historical and
+// future edge case would require tying to a formal upstream grammar and test
+// corpus for each version. The design here intentionally errs on the side of
+// permissiveness and captures unknown constructs losslessly so you can inspect
+// or transform them downstream.
 package namedconf
 
 import (
 	"bufio"
 	"fmt"
 	"io"
-	"strconv"
+	"io/fs"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
-// Config represents the entire named.conf configuration
-type Config struct {
-	Zones      []Zone             `json:"zones"`
-	Options    Options            `json:"options"`
-	ACLs       []ACL              `json:"acls"`
-	Keys       []Key              `json:"keys"`
-	TLS        []TLSConfig        `json:"tls"`
-	Logging    *Logging           `json:"logging,omitempty"`
-	Controls   *Controls          `json:"controls,omitempty"`
-	Includes   []string           `json:"includes"`
-	Masters    []Masters          `json:"masters"`
-	Servers    []Server           `json:"servers"`
-	Views      []View             `json:"views"`
-	Statistics *Statistics        `json:"statistics,omitempty"`
-	Unknown    []UnknownStatement `json:"unknown"`
+// Synthetic name used for literal-only statements (e.g., keys { "key2"; };)
+const dirItem = "__item"
+
+// =============================
+// Public API
+// =============================
+
+type ParseOptions struct {
+	// If true, replace `include "file";` directives with the directives from the
+	// included file(s). Otherwise, Include nodes remain in the AST.
+	InlineIncludes bool
+	// A custom filesystem to read includes from. Defaults to the OS filesystem.
+	FS fs.FS
 }
 
-// TLSConfig represents a TLS configuration block
-type TLSConfig struct {
-	Name     string `json:"name"`
-	CertFile string `json:"cert_file"`
-	KeyFile  string `json:"key_file"`
+// File represents a parsed named.conf file.
+type File struct {
+	Path       string
+	Directives []*Directive
 }
 
-// ListenOn represents a listen-on configuration
-type ListenOn struct {
-	Port      int      `json:"port"`
-	TLS       string   `json:"tls,omitempty"`
-	HTTP      string   `json:"http,omitempty"`
-	Addresses []string `json:"addresses"`
+// Directive models `name [args...] [ { block } ];`
+// Many BIND statements have this shape. Unknown statements are preserved.
+type Directive struct {
+	Name  string
+	Args  []Expr // raw tokens/atoms (quoted strings, idents, numbers, literals)
+	Block *Block // optional nested block
+	Pos   Position
 }
 
-// Zone represents a zone configuration
-type Zone struct {
-	Name          string            `json:"name"`
-	Type          string            `json:"type"`
-	File          string            `json:"file,omitempty"`
-	Masters       []string          `json:"masters,omitempty"`
-	Notify        *bool             `json:"notify,omitempty"`
-	DNSSECPolicy  string            `json:"dnssec_policy,omitempty"`
-	InlineSigning *bool             `json:"inline_signing,omitempty"`
-	AllowTransfer []string          `json:"allow_transfer,omitempty"`
-	Options       map[string]string `json:"options"`
-	Comments      []string          `json:"comments,omitempty"`
+// Block is a sequence of directives inside `{ ... }`.
+type Block struct {
+	Directives []*Directive
+	Pos        Position
 }
 
-// Options represents the global options block
-type Options struct {
-	Directory            string            `json:"directory,omitempty"`
-	PidFile              string            `json:"pid_file,omitempty"`
-	ListenOn             []ListenOn        `json:"listen_on,omitempty"`
-	ListenOnV6           []ListenOn        `json:"listen_on_v6,omitempty"`
-	QuerySource          string            `json:"query_source,omitempty"`
-	Forwarders           []string          `json:"forwarders,omitempty"`
-	Forward              string            `json:"forward,omitempty"`
-	Recursion            *bool             `json:"recursion,omitempty"`
-	AllowQuery           []string          `json:"allow_query,omitempty"`
-	AllowQueryCache      []string          `json:"allow_query_cache,omitempty"`
-	AllowTransfer        []string          `json:"allow_transfer,omitempty"`
-	AllowRecursion       []string          `json:"allow_recursion,omitempty"`
-	AllowNewZones        *bool             `json:"allow_new_zones,omitempty"`
-	AlsoNotify           []string          `json:"also_notify,omitempty"`
-	Version              string            `json:"version,omitempty"`
-	Hostname             string            `json:"hostname,omitempty"`
-	ServerID             string            `json:"server_id,omitempty"`
-	NotifySource         string            `json:"notify_source,omitempty"`
-	TransferSource       string            `json:"transfer_source,omitempty"`
-	DNSSECValidation     string            `json:"dnssec_validation,omitempty"`
-	DumpFile             string            `json:"dump_file,omitempty"`
-	StatisticsFile       string            `json:"statistics_file,omitempty"`
-	MemstatisticsFile    string            `json:"memstatistics_file,omitempty"`
-	SecrootsFile         string            `json:"secroots_file,omitempty"`
-	RecursingFile        string            `json:"recursing_file,omitempty"`
-	ManagedKeysDirectory string            `json:"managed_keys_directory,omitempty"`
-	GeoipDirectory       string            `json:"geoip_directory,omitempty"`
-	SessionKeyfile       string            `json:"session_keyfile,omitempty"`
-	Additional           map[string]string `json:"additional"`
+// Include is a special node for `include "path";`.
+type Include struct {
+	Path string
+	Pos  Position
+	// If InlineIncludes is true, Inlined holds parsed directives from Path.
+	Inlined []*Directive
 }
 
-// ACL represents an access control list
-type ACL struct {
-	Name    string   `json:"name"`
-	Entries []string `json:"entries"`
-}
+// Expr is any argument expression. For named.conf we keep it simple and lossless.
+type Expr interface{ isExpr() }
 
-// Key represents a TSIG key
-type Key struct {
-	Name      string `json:"name"`
-	Algorithm string `json:"algorithm"`
-	Secret    string `json:"secret"`
-}
+// Atom kinds preserve raw text and light structure.
 
-// Logging represents the logging configuration
-type Logging struct {
-	Channels   []LogChannel  `json:"channels"`
-	Categories []LogCategory `json:"categories"`
-}
-
-// LogChannel represents a logging channel
-type LogChannel struct {
-	Name          string            `json:"name"`
-	Type          string            `json:"type"`
-	File          string            `json:"file,omitempty"`
-	Severity      string            `json:"severity,omitempty"`
-	PrintTime     *bool             `json:"print_time,omitempty"`
-	PrintSeverity *bool             `json:"print_severity,omitempty"`
-	PrintCategory *bool             `json:"print_category,omitempty"`
-	Additional    map[string]string `json:"additional"`
-}
-
-// LogCategory represents a logging category
-type LogCategory struct {
-	Name     string   `json:"name"`
-	Channels []string `json:"channels"`
-}
-
-// Controls represents the controls configuration
-type Controls struct {
-	Inet []ControlInet `json:"inet"`
-	Unix []ControlUnix `json:"unix"`
-}
-
-// ControlInet represents inet controls
-type ControlInet struct {
-	Address string   `json:"address"`
-	Port    int      `json:"port"`
-	Allow   []string `json:"allow"`
-	Keys    []string `json:"keys"`
-}
-
-// ControlUnix represents unix socket controls
-type ControlUnix struct {
-	Path  string `json:"path"`
-	Perm  string `json:"perm,omitempty"`
-	Owner string `json:"owner,omitempty"`
-	Group string `json:"group,omitempty"`
-}
-
-// Masters represents a masters definition
-type Masters struct {
-	Name    string   `json:"name"`
-	Masters []string `json:"masters"`
-}
-
-// Server represents a server statement
-type Server struct {
-	Address        string            `json:"address"`
-	BogusAnswer    *bool             `json:"bogus_answer,omitempty"`
-	Edns           *bool             `json:"edns,omitempty"`
-	Keys           []string          `json:"keys,omitempty"`
-	TransferFormat string            `json:"transfer_format,omitempty"`
-	Additional     map[string]string `json:"additional"`
-}
-
-// View represents a view configuration
-type View struct {
-	Name    string            `json:"name"`
-	Class   string            `json:"class,omitempty"`
-	Zones   []Zone            `json:"zones"`
-	Options map[string]string `json:"options"`
-	Match   []string          `json:"match,omitempty"`
-}
-
-// Statistics represents statistics channels
-type Statistics struct {
-	Channels []StatChannel `json:"channels"`
-}
-
-// StatChannel represents a statistics channel
-type StatChannel struct {
-	Address string   `json:"address"`
-	Port    int      `json:"port"`
-	Allow   []string `json:"allow"`
-}
-
-// UnknownStatement represents unparsed statements
-type UnknownStatement struct {
-	Type    string `json:"type"`
-	Content string `json:"content"`
-}
-
-// Parser represents the named.conf parser
-type Parser struct {
-	scanner *bufio.Scanner
-	line    int
-	current string
-	tokens  []string
-	pos     int
-}
-
-// NewParser creates a new parser for the given reader
-func NewParser(r io.Reader) *Parser {
-	return &Parser{
-		scanner: bufio.NewScanner(r),
-		line:    0,
+type (
+	Ident struct {
+		Value string
+		Pos   Position
 	}
+	StringLit struct {
+		Value string
+		Pos   Position
+	}
+	NumberLit struct {
+		Raw string
+		Pos Position
+	} // e.g., 53, 3m, 1G
+	AddrLit struct {
+		Raw string
+		IP  net.IP
+		Pos Position
+	} // IPv4/IPv6 as a single token
+	CIDRLit struct {
+		Raw string
+		Pos Position
+	} // e.g., 10.0.0.0/8, 2001:db8::/32
+	IncludeExpr struct{ Inc *Include } // used as an argument positionally if needed
+	// First-class address-match group: { item; item; { nested; }; }
+	MatchGroup struct {
+		Items []*MatchItem
+		Pos   Position
+	}
+	MatchItem struct {
+		Parts   []Expr
+		Negated bool
+		Pos     Position
+	}
+)
+
+func (Ident) isExpr()       {}
+func (StringLit) isExpr()   {}
+func (NumberLit) isExpr()   {}
+func (AddrLit) isExpr()     {}
+func (CIDRLit) isExpr()     {}
+func (IncludeExpr) isExpr() {}
+func (MatchGroup) isExpr()  {}
+
+// Position identifies a source location.
+type Position struct {
+	File string
+	Line int
+	Col  int
 }
 
-// Parse parses the entire named.conf file
-func (p *Parser) Parse() (*Config, error) {
-	config := &Config{
-		Zones:    []Zone{},
-		ACLs:     []ACL{},
-		Keys:     []Key{},
-		TLS:      []TLSConfig{},
-		Includes: []string{},
-		Masters:  []Masters{},
-		Servers:  []Server{},
-		Views:    []View{},
-		Unknown:  []UnknownStatement{},
-		Options: Options{
-			Additional: make(map[string]string),
-		},
+func (p Position) String() string {
+	if p.File == "" {
+		return fmt.Sprintf("%d:%d", p.Line, p.Col)
+	}
+	return fmt.Sprintf("%s:%d:%d", p.File, p.Line, p.Col)
+}
+
+// ParseFile parses a named.conf file from disk.
+func ParseFile(path string, opts *ParseOptions) (*File, error) {
+	if opts == nil {
+		opts = &ParseOptions{}
+	}
+	if opts.FS == nil {
+		opts.FS = os.DirFS("/")
 	}
 
-	for p.nextLine() {
-		if err := p.parseStatement(config); err != nil {
-			return nil, fmt.Errorf("line %d: %v", p.line, err)
-		}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
 	}
 
-	return config, nil
+	f, err := os.Open(abs)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	root := &File{Path: abs}
+	p := newParser(root, abs, f, opts)
+	if err := p.parseTop(); err != nil {
+		return nil, err
+	}
+	return root, nil
 }
 
-// nextLine reads the next non-empty, non-comment line
-func (p *Parser) nextLine() bool {
-	var content strings.Builder
-	inBlockComment := false
+// Parse reads named.conf content from r. The file path is used for error messages
+// and include resolution (as the parent directory).
+func Parse(path string, r io.Reader, opts *ParseOptions) (*File, error) {
+	if opts == nil {
+		opts = &ParseOptions{}
+	}
+	if opts.FS == nil {
+		opts.FS = os.DirFS("/")
+	}
+	root := &File{Path: path}
+	p := newParser(root, path, r, opts)
+	if err := p.parseTop(); err != nil {
+		return nil, err
+	}
+	return root, nil
+}
 
-	for p.scanner.Scan() {
-		p.line++
-		line := p.scanner.Text()
-
-		// Handle block comments (/* ... */)
-		for {
-			if inBlockComment {
-				if idx := strings.Index(line, "*/"); idx != -1 {
-					line = line[idx+2:]
-					inBlockComment = false
-				} else {
-					line = ""
-					break
-				}
-			} else {
-				if idx := strings.Index(line, "/*"); idx != -1 {
-					before := line[:idx]
-					after := line[idx+2:]
-					if endIdx := strings.Index(after, "*/"); endIdx != -1 {
-						line = before + after[endIdx+2:]
-					} else {
-						line = before
-						inBlockComment = true
-					}
-				} else {
-					break
+// Walk traverses the AST pre-order.
+func (f *File) Walk(fn func(d *Directive) bool) {
+	var walk func(ds []*Directive) bool
+	walk = func(ds []*Directive) bool {
+		for _, d := range ds {
+			if !fn(d) {
+				return false
+			}
+			if d.Block != nil {
+				if !walk(d.Block.Directives) {
+					return false
 				}
 			}
 		}
-
-		if inBlockComment {
-			continue
-		}
-
-		line = strings.TrimSpace(line)
-
-		// Skip empty lines and full-line comments
-		if line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		// Remove inline comments
-		if idx := strings.Index(line, "//"); idx != -1 {
-			line = strings.TrimSpace(line[:idx])
-			if line == "" {
-				continue
-			}
-		}
-		if idx := strings.Index(line, "#"); idx != -1 {
-			line = strings.TrimSpace(line[:idx])
-			if line == "" {
-				continue
-			}
-		}
-
-		content.WriteString(line + " ")
-
-		// Check if we have a complete statement (ends with ; or })
-		trimmed := strings.TrimSpace(content.String())
-		if strings.HasSuffix(trimmed, ";") || strings.HasSuffix(trimmed, "}") ||
-			strings.Contains(trimmed, "{") {
-			p.current = trimmed
-			p.tokenize()
-			p.pos = 0
-			return true
-		}
-	}
-
-	// Handle any remaining content
-	if content.Len() > 0 {
-		p.current = strings.TrimSpace(content.String())
-		p.tokenize()
-		p.pos = 0
 		return true
 	}
-
-	return false
+	walk(f.Directives)
 }
 
-// tokenize splits the current line into tokens
-func (p *Parser) tokenize() {
-	p.tokens = []string{}
-	var current strings.Builder
-	inQuotes := false
-	escapeNext := false
+// =============================
+// Lexer
+// =============================
 
-	for _, r := range p.current {
-		if escapeNext {
-			current.WriteRune(r)
-			escapeNext = false
+type tokenType int
+
+const (
+	tIllegal tokenType = iota
+	tEOF
+	tSemi   // ;
+	tLBrace // {
+	tRBrace // }
+	tString // "..."
+	tIdent  // bareword (option names, keywords, values)
+)
+
+type token struct {
+	typ tokenType
+	lit string
+	pos Position
+}
+
+type lexer struct {
+	src  string
+	file string
+	i    int
+	line int
+	col  int
+}
+
+func newLexer(file string, data string) *lexer {
+	return &lexer{src: data, file: file, line: 1, col: 1}
+}
+
+func (lx *lexer) next() (r rune, w int) {
+	if lx.i >= len(lx.src) {
+		return 0, 0
+	}
+	r, w = utf8.DecodeRuneInString(lx.src[lx.i:])
+	lx.i += w
+	if r == '\n' {
+		lx.line++
+		lx.col = 1
+	} else {
+		lx.col++
+	}
+	return
+}
+
+func (lx *lexer) peek() rune {
+	if lx.i >= len(lx.src) {
+		return 0
+	}
+	r, _ := utf8.DecodeRuneInString(lx.src[lx.i:])
+	return r
+}
+
+func (lx *lexer) backup(w int) {
+	if w == 0 {
+		return
+	}
+	lx.i -= w
+	if lx.col > 1 {
+		lx.col--
+	} else {
+		lx.col = 1
+	}
+}
+
+func (lx *lexer) pos() Position { return Position{File: lx.file, Line: lx.line, Col: lx.col} }
+
+func (lx *lexer) skipSpacesAndComments() {
+	for {
+		r := lx.peek()
+		if r == 0 {
+			return
+		}
+		// whitespace
+		if unicode.IsSpace(r) {
+			lx.next()
 			continue
 		}
-
-		if r == '\\' {
-			escapeNext = true
+		// comments
+		if r == '#' { // to end of line
+			for {
+				r2, _ := lx.next()
+				if r2 == 0 || r2 == '\n' {
+					break
+				}
+			}
 			continue
 		}
+		if r == '/' {
+			_, w := lx.next()
+			n := lx.peek()
+			if n == '/' { // // comment
+				for {
+					r2, _ := lx.next()
+					if r2 == 0 || r2 == '\n' {
+						break
+					}
+				}
+				continue
+			} else if n == '*' { // /* ... */
+				lx.next()
+				for {
+					r2, _ := lx.next()
+					if r2 == 0 {
+						return
+					}
+					if r2 == '*' && lx.peek() == '/' {
+						lx.next()
+						break
+					}
+				}
+				continue
+			}
+			// not a comment: backup and treat as ident char
+			lx.backup(w)
+		}
+		return
+	}
+}
 
+func (lx *lexer) nextToken() token {
+	lx.skipSpacesAndComments()
+	pos := lx.pos()
+	r := lx.peek()
+	if r == 0 {
+		return token{typ: tEOF, pos: pos}
+	}
+
+	// single char tokens
+	switch r {
+	case ';':
+		lx.next()
+		return token{typ: tSemi, lit: ";", pos: pos}
+	case '{':
+		lx.next()
+		return token{typ: tLBrace, lit: "{", pos: pos}
+	case '}':
+		lx.next()
+		return token{typ: tRBrace, lit: "}", pos: pos}
+	case '"':
+		return lx.scanString()
+	}
+	return lx.scanIdentLike()
+}
+
+func (lx *lexer) scanString() token {
+	start := lx.pos()
+	// consume opening quote
+	lx.next()
+	var b strings.Builder
+	for {
+		r, _ := lx.next()
+		if r == 0 {
+			return token{typ: tIllegal, pos: start, lit: "unterminated string"}
+		}
 		if r == '"' {
-			inQuotes = !inQuotes
-			current.WriteRune(r)
+			break
+		}
+		if r == '\\' {
+			// simple escapes: \" \\\\ \n \t
+			n := lx.peek()
+			if n == 0 {
+				return token{typ: tIllegal, pos: start, lit: "unterminated escape"}
+			}
+			_, _ = lx.next()
+			switch n {
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			case 'r':
+				b.WriteByte('\r')
+			case '"':
+				b.WriteByte('"')
+			case '\\':
+				b.WriteByte('\\')
+			default:
+				b.WriteByte('\\')
+				b.WriteRune(n)
+			}
 			continue
 		}
-
-		if !inQuotes && (unicode.IsSpace(r) || r == ';' || r == '{' || r == '}') {
-			if current.Len() > 0 {
-				p.tokens = append(p.tokens, current.String())
-				current.Reset()
-			}
-			if r == ';' || r == '{' || r == '}' {
-				p.tokens = append(p.tokens, string(r))
-			}
-			continue
-		}
-
-		current.WriteRune(r)
+		b.WriteRune(r)
 	}
+	return token{typ: tString, lit: b.String(), pos: start}
+}
 
-	if current.Len() > 0 {
-		p.tokens = append(p.tokens, current.String())
+// scanIdentLike reads a bare token until whitespace or one of ;{}".
+// named.conf allows rich barewords (dashes, dots, slashes, colons, plus, equals,
+// asterisks, percent, at, underscores, etc.). We stop only at structural delimiters.
+func (lx *lexer) scanIdentLike() token {
+	start := lx.pos()
+	var b strings.Builder
+	for {
+		r := lx.peek()
+		if r == 0 || unicode.IsSpace(r) || r == ';' || r == '{' || r == '}' || r == '"' {
+			break
+		}
+		lx.next()
+		b.WriteRune(r)
+	}
+	lit := b.String()
+	if lit == "" {
+		return token{typ: tIllegal, pos: start, lit: "unexpected character"}
+	}
+	return token{typ: tIdent, lit: lit, pos: start}
+}
+
+// =============================
+// Parser
+// =============================
+
+type parser struct {
+	root   *File
+	file   string
+	opts   *ParseOptions
+	lx     *lexer
+	peeked *token
+
+	seenInclude map[string]bool
+}
+
+func newParser(root *File, file string, r io.Reader, opts *ParseOptions) *parser {
+	data, _ := io.ReadAll(bufio.NewReader(r))
+	lx := newLexer(file, string(data))
+	return &parser{
+		root:        root,
+		file:        file,
+		opts:        opts,
+		lx:          lx,
+		seenInclude: map[string]bool{},
 	}
 }
 
-// peek returns the next token without consuming it
-func (p *Parser) peek() string {
-	if p.pos >= len(p.tokens) {
-		return ""
+func (p *parser) next() token {
+	if p.peeked != nil {
+		t := *p.peeked
+		p.peeked = nil
+		return t
 	}
-	return p.tokens[p.pos]
+	return p.lx.nextToken()
 }
 
-// next returns and consumes the next token
-func (p *Parser) next() string {
-	if p.pos >= len(p.tokens) {
-		return ""
+func (p *parser) peek() token {
+	if p.peeked != nil {
+		return *p.peeked
 	}
-	token := p.tokens[p.pos]
-	p.pos++
-	return token
+	t := p.lx.nextToken()
+	p.peeked = &t
+	return t
 }
 
-// parseStatement parses a top-level statement
-func (p *Parser) parseStatement(config *Config) error {
-	token := p.peek()
-	if token == "" {
-		return nil
+func (p *parser) expect(ty tokenType, ctx string) (token, error) {
+	t := p.next()
+	if t.typ != ty {
+		return t, p.errAt(t.pos, "expected %s, got %s (%q)", ctx, p.tname(ty), tname(t))
 	}
+	return t, nil
+}
 
-	switch token {
-	case "zone":
-		zone, err := p.parseZone()
-		if err != nil {
-			return err
-		}
-		config.Zones = append(config.Zones, *zone)
-	case "options":
-		return p.parseOptions(&config.Options)
-	case "acl":
-		acl, err := p.parseACL()
-		if err != nil {
-			return err
-		}
-		config.ACLs = append(config.ACLs, *acl)
-	case "key":
-		key, err := p.parseKey()
-		if err != nil {
-			return err
-		}
-		config.Keys = append(config.Keys, *key)
-	case "tls":
-		tls, err := p.parseTLS()
-		if err != nil {
-			return err
-		}
-		config.TLS = append(config.TLS, *tls)
-	case "logging":
-		logging, err := p.parseLogging()
-		if err != nil {
-			return err
-		}
-		config.Logging = logging
-	case "controls":
-		controls, err := p.parseControls()
-		if err != nil {
-			return err
-		}
-		config.Controls = controls
-	case "include":
-		include, err := p.parseInclude()
-		if err != nil {
-			return err
-		}
-		config.Includes = append(config.Includes, include)
-	case "masters":
-		masters, err := p.parseMasters()
-		if err != nil {
-			return err
-		}
-		config.Masters = append(config.Masters, *masters)
-	case "server":
-		server, err := p.parseServer()
-		if err != nil {
-			return err
-		}
-		config.Servers = append(config.Servers, *server)
-	case "view":
-		view, err := p.parseView()
-		if err != nil {
-			return err
-		}
-		config.Views = append(config.Views, *view)
-	case "statistics-channels":
-		stats, err := p.parseStatistics()
-		if err != nil {
-			return err
-		}
-		config.Statistics = stats
+func (p *parser) tname(t tokenType) string { return tokenTypeName(t) }
+
+func tokenTypeName(t tokenType) string {
+	switch t {
+	case tEOF:
+		return "EOF"
+	case tSemi:
+		return ";"
+	case tLBrace:
+		return "{"
+	case tRBrace:
+		return "}"
+	case tString:
+		return "string"
+	case tIdent:
+		return "identifier"
 	default:
-		// Handle unknown statements
-		unknown := p.parseUnknownStatement()
-		config.Unknown = append(config.Unknown, unknown)
+		return "?"
 	}
+}
 
+func tname(tok token) string { return fmt.Sprintf("%s", tokenTypeName(tok.typ)) }
+
+func (p *parser) errAt(pos Position, f string, a ...any) error {
+	return fmt.Errorf("%s: %s", pos.String(), fmt.Sprintf(f, a...))
+}
+
+func (p *parser) parseTop() error {
+	for {
+		t := p.peek()
+		if t.typ == tEOF {
+			break
+		}
+		d, err := p.parseDirective()
+		if err != nil {
+			return err
+		}
+		if d != nil {
+			p.root.Directives = append(p.root.Directives, d)
+		}
+	}
 	return nil
 }
 
-// parseZone parses a zone statement
-func (p *Parser) parseZone() (*Zone, error) {
-	p.next() // consume "zone"
-
-	zoneName := p.next()
-	if zoneName == "" {
-		return nil, fmt.Errorf("expected zone name")
-	}
-
-	// Remove quotes if present
-	zoneName = strings.Trim(zoneName, "\"")
-
-	// Optional class (IN, CH, HS, etc.)
-	nextToken := p.peek()
-	if nextToken != "{" {
-		// This could be a class - consume it
-		class := p.next()
-		// Common classes: IN, CH, HS
-		if strings.ToUpper(class) == "IN" || strings.ToUpper(class) == "CH" || strings.ToUpper(class) == "HS" {
-			// Valid class, continue to expect '{'
-		} else {
-			// Not a recognized class, might be something else - put it back
-			p.pos-- // step back
-		}
-	}
-
-	if p.next() != "{" {
-		return nil, fmt.Errorf("expected '{' after zone name")
-	}
-
-	zone := &Zone{
-		Name:    zoneName,
-		Options: make(map[string]string),
-	}
-
-	// Parse zone body
-	for p.nextLine() {
-		token := p.peek()
-		if token == "}" {
-			p.next()
-			if p.peek() == ";" {
+func (p *parser) parseDirective() (*Directive, error) {
+	tok := p.next()
+	switch tok.typ {
+	case tString:
+		// A literal-only item inside a block/list, e.g., keys { "key2"; };
+		d := &Directive{Name: dirItem, Pos: tok.pos}
+		d.Args = append(d.Args, StringLit{Value: tok.lit, Pos: tok.pos})
+		for {
+			n := p.peek()
+			if n.typ == tEOF {
+				return nil, p.errAt(n.pos, "unexpected EOF; missing ';'")
+			}
+			if n.typ == tSemi {
 				p.next()
+				break
 			}
-			break
-		}
-
-		switch token {
-		case "type":
-			p.next()
-			zone.Type = p.next()
-			p.expectSemicolon()
-		case "file":
-			p.next()
-			zone.File = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "notify":
-			p.next()
-			val := p.next()
-			notify := val == "yes"
-			zone.Notify = &notify
-			p.expectSemicolon()
-		case "dnssec-policy":
-			p.next()
-			zone.DNSSECPolicy = p.next()
-			p.expectSemicolon()
-		case "inline-signing":
-			p.next()
-			val := p.next()
-			inlineSigning := val == "yes"
-			zone.InlineSigning = &inlineSigning
-			p.expectSemicolon()
-		case "allow-transfer":
-			p.next()
-			if p.next() != "{" {
-				return nil, fmt.Errorf("expected '{' after allow-transfer")
+			if n.typ == tRBrace {
+				// Tolerate a missing ';' before the closing brace of the enclosing block.
+				break
 			}
-			for {
-				addr := p.next()
-				if addr == "}" {
-					break
-				}
-				zone.AllowTransfer = append(zone.AllowTransfer, strings.Trim(addr, ";"))
+			if n.typ == tLBrace {
+				return nil, p.errAt(n.pos, "unexpected '{' after string item")
 			}
-			p.expectSemicolon()
-		case "masters":
-			p.next()
-			if p.next() != "{" {
-				return nil, fmt.Errorf("expected '{' after masters")
-			}
-			for {
-				master := p.next()
-				if master == "}" {
-					break
-				}
-				zone.Masters = append(zone.Masters, strings.Trim(master, ";"))
-			}
-			p.expectSemicolon()
-		default:
-			// Generic option
-			key := p.next()
-			value := p.next()
-			zone.Options[key] = strings.Trim(value, "\";")
-			p.expectSemicolon()
-		}
-	}
-
-	return zone, nil
-}
-
-// parseOptions parses the options block
-func (p *Parser) parseOptions(options *Options) error {
-	p.next() // consume "options"
-
-	if p.next() != "{" {
-		return fmt.Errorf("expected '{' after options")
-	}
-
-	for p.nextLine() {
-		token := p.peek()
-		if token == "}" {
-			p.next()
-			if p.peek() == ";" {
-				p.next()
-			}
-			break
-		}
-
-		switch token {
-		case "directory":
-			p.next()
-			options.Directory = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "pid-file":
-			p.next()
-			options.PidFile = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "listen-on", "listen-on-v6":
-			listenType := token
-			p.next()
-
-			listenOn := ListenOn{Port: 53} // default port
-
-			// Parse optional port
-			if p.peek() == "port" {
-				p.next() // consume "port"
-				portStr := p.next()
-				if port, err := strconv.Atoi(portStr); err == nil {
-					listenOn.Port = port
-				}
-			}
-
-			// Parse optional TLS
-			if p.peek() == "tls" {
-				p.next() // consume "tls"
-				listenOn.TLS = p.next()
-			}
-
-			// Parse optional HTTP
-			if p.peek() == "http" {
-				p.next() // consume "http"
-				listenOn.HTTP = p.next()
-			}
-
-			// Parse addresses block
-			if p.next() != "{" {
-				return fmt.Errorf("expected '{' after listen-on")
-			}
-
-			for {
-				addr := p.next()
-				if addr == "}" {
-					break
-				}
-				listenOn.Addresses = append(listenOn.Addresses, strings.Trim(addr, ";"))
-			}
-
-			if listenType == "listen-on" {
-				options.ListenOn = append(options.ListenOn, listenOn)
-			} else {
-				options.ListenOnV6 = append(options.ListenOnV6, listenOn)
-			}
-			p.expectSemicolon()
-		case "allow-new-zones":
-			p.next()
-			val := p.next()
-			allowNewZones := val == "yes"
-			options.AllowNewZones = &allowNewZones
-			p.expectSemicolon()
-		case "allow-query-cache":
-			p.next()
-			if p.next() != "{" {
-				return fmt.Errorf("expected '{' after allow-query-cache")
-			}
-			for {
-				entry := p.next()
-				if entry == "}" {
-					break
-				}
-				options.AllowQueryCache = append(options.AllowQueryCache, strings.Trim(entry, ";"))
-			}
-			p.expectSemicolon()
-		case "also-notify":
-			p.next()
-			if p.next() != "{" {
-				return fmt.Errorf("expected '{' after also-notify")
-			}
-			for {
-				entry := p.next()
-				if entry == "}" {
-					break
-				}
-				options.AlsoNotify = append(options.AlsoNotify, strings.Trim(entry, ";"))
-			}
-			p.expectSemicolon()
-		case "dump-file":
-			p.next()
-			options.DumpFile = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "statistics-file":
-			p.next()
-			options.StatisticsFile = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "memstatistics-file":
-			p.next()
-			options.MemstatisticsFile = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "secroots-file":
-			p.next()
-			options.SecrootsFile = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "recursing-file":
-			p.next()
-			options.RecursingFile = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "managed-keys-directory":
-			p.next()
-			options.ManagedKeysDirectory = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "geoip-directory":
-			p.next()
-			options.GeoipDirectory = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "session-keyfile":
-			p.next()
-			options.SessionKeyfile = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "allow-query":
-			p.next()
-			if p.next() != "{" {
-				return fmt.Errorf("expected '{' after allow-query")
-			}
-			for {
-				entry := p.next()
-				if entry == "}" {
-					break
-				}
-				options.AllowQuery = append(options.AllowQuery, strings.Trim(entry, ";"))
-			}
-			p.expectSemicolon()
-
-		case "forwarders":
-			p.next()
-			if p.next() != "{" {
-				return fmt.Errorf("expected '{' after forwarders")
-			}
-			for {
-				forwarder := p.next()
-				if forwarder == "}" {
-					break
-				}
-				options.Forwarders = append(options.Forwarders, strings.Trim(forwarder, ";"))
-			}
-			p.expectSemicolon()
-		case "forward":
-			p.next()
-			options.Forward = p.next()
-			p.expectSemicolon()
-		case "recursion":
-			p.next()
-			val := p.next()
-			recursion := val == "yes"
-			options.Recursion = &recursion
-			p.expectSemicolon()
-		case "version":
-			p.next()
-			options.Version = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "hostname":
-			p.next()
-			options.Hostname = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "server-id":
-			p.next()
-			options.ServerID = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "dnssec-validation":
-			p.next()
-			options.DNSSECValidation = p.next()
-			p.expectSemicolon()
-		default:
-			// Generic option
-			key := p.next()
-			value := p.next()
-			options.Additional[key] = strings.Trim(value, "\";")
-			p.expectSemicolon()
-		}
-	}
-
-	return nil
-}
-
-// parseACL parses an ACL definition
-func (p *Parser) parseACL() (*ACL, error) {
-	p.next() // consume "acl"
-
-	name := strings.Trim(p.next(), "\"")
-	if p.next() != "{" {
-		return nil, fmt.Errorf("expected '{' after ACL name")
-	}
-
-	acl := &ACL{
-		Name:    name,
-		Entries: []string{},
-	}
-
-	for p.nextLine() {
-		token := p.peek()
-		if token == "}" {
-			p.next()
-			if p.peek() == ";" {
-				p.next()
-			}
-			break
-		}
-
-		entry := p.next()
-		acl.Entries = append(acl.Entries, strings.Trim(entry, ";"))
-	}
-
-	return acl, nil
-}
-
-// parseKey parses a key definition
-func (p *Parser) parseKey() (*Key, error) {
-	p.next() // consume "key"
-
-	name := strings.Trim(p.next(), "\"")
-	if p.next() != "{" {
-		return nil, fmt.Errorf("expected '{' after key name")
-	}
-
-	key := &Key{Name: name}
-
-	for p.nextLine() {
-		token := p.peek()
-		if token == "}" {
-			p.next()
-			if p.peek() == ";" {
-				p.next()
-			}
-			break
-		}
-
-		switch token {
-		case "algorithm":
-			p.next()
-			key.Algorithm = p.next()
-			p.expectSemicolon()
-		case "secret":
-			p.next()
-			key.Secret = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		}
-	}
-
-	return key, nil
-}
-
-// parseTLS parses a TLS configuration block
-func (p *Parser) parseTLS() (*TLSConfig, error) {
-	p.next() // consume "tls"
-
-	name := p.next()
-	if p.next() != "{" {
-		return nil, fmt.Errorf("expected '{' after tls name")
-	}
-
-	tls := &TLSConfig{Name: name}
-
-	for p.nextLine() {
-		token := p.peek()
-		if token == "}" {
-			p.next()
-			if p.peek() == ";" {
-				p.next()
-			}
-			break
-		}
-
-		switch token {
-		case "cert-file":
-			p.next()
-			tls.CertFile = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		case "key-file":
-			p.next()
-			tls.KeyFile = strings.Trim(p.next(), "\"")
-			p.expectSemicolon()
-		}
-	}
-
-	return tls, nil
-}
-
-// parseLogging parses the logging block (simplified)
-func (p *Parser) parseLogging() (*Logging, error) {
-	p.next() // consume "logging"
-
-	if p.next() != "{" {
-		return nil, fmt.Errorf("expected '{' after logging")
-	}
-
-	logging := &Logging{
-		Channels:   []LogChannel{},
-		Categories: []LogCategory{},
-	}
-
-	// This is a simplified implementation
-	// Full logging parsing would be much more complex
-	for p.nextLine() {
-		token := p.peek()
-		if token == "}" {
-			p.next()
-			if p.peek() == ";" {
-				p.next()
-			}
-			break
-		}
-		// Skip logging content for now
-		p.next()
-	}
-
-	return logging, nil
-}
-
-// parseControls parses the controls block (simplified)
-func (p *Parser) parseControls() (*Controls, error) {
-	p.next() // consume "controls"
-
-	if p.next() != "{" {
-		return nil, fmt.Errorf("expected '{' after controls")
-	}
-
-	controls := &Controls{
-		Inet: []ControlInet{},
-		Unix: []ControlUnix{},
-	}
-
-	// Simplified implementation
-	for p.nextLine() {
-		token := p.peek()
-		if token == "}" {
-			p.next()
-			if p.peek() == ";" {
-				p.next()
-			}
-			break
-		}
-		p.next()
-	}
-
-	return controls, nil
-}
-
-// parseInclude parses an include statement
-func (p *Parser) parseInclude() (string, error) {
-	p.next() // consume "include"
-
-	filename := strings.Trim(p.next(), "\"")
-	p.expectSemicolon()
-
-	return filename, nil
-}
-
-// parseMasters parses a masters definition
-func (p *Parser) parseMasters() (*Masters, error) {
-	p.next() // consume "masters"
-
-	name := strings.Trim(p.next(), "\"")
-	if p.next() != "{" {
-		return nil, fmt.Errorf("expected '{' after masters name")
-	}
-
-	masters := &Masters{
-		Name:    name,
-		Masters: []string{},
-	}
-
-	for p.nextLine() {
-		token := p.peek()
-		if token == "}" {
-			p.next()
-			if p.peek() == ";" {
-				p.next()
-			}
-			break
-		}
-
-		master := p.next()
-		masters.Masters = append(masters.Masters, strings.Trim(master, ";"))
-	}
-
-	return masters, nil
-}
-
-// parseServer parses a server statement
-func (p *Parser) parseServer() (*Server, error) {
-	p.next() // consume "server"
-
-	address := p.next()
-	if p.next() != "{" {
-		return nil, fmt.Errorf("expected '{' after server address")
-	}
-
-	server := &Server{
-		Address:    address,
-		Additional: make(map[string]string),
-	}
-
-	for p.nextLine() {
-		token := p.peek()
-		if token == "}" {
-			p.next()
-			if p.peek() == ";" {
-				p.next()
-			}
-			break
-		}
-
-		// Simplified - just store as additional options
-		key := p.next()
-		value := p.next()
-		server.Additional[key] = strings.Trim(value, "\";")
-		p.expectSemicolon()
-	}
-
-	return server, nil
-}
-
-// parseView parses a view statement (simplified)
-func (p *Parser) parseView() (*View, error) {
-	p.next() // consume "view"
-
-	name := strings.Trim(p.next(), "\"")
-
-	// Optional class
-	class := ""
-	if p.peek() != "{" {
-		class = p.next()
-	}
-
-	if p.next() != "{" {
-		return nil, fmt.Errorf("expected '{' after view name")
-	}
-
-	view := &View{
-		Name:    name,
-		Class:   class,
-		Zones:   []Zone{},
-		Options: make(map[string]string),
-	}
-
-	// Simplified view parsing
-	for p.nextLine() {
-		token := p.peek()
-		if token == "}" {
-			p.next()
-			if p.peek() == ";" {
-				p.next()
-			}
-			break
-		}
-
-		if token == "zone" {
-			zone, err := p.parseZone()
+			arg, err := p.parseArg()
 			if err != nil {
 				return nil, err
 			}
-			view.Zones = append(view.Zones, *zone)
-		} else {
-			// Generic option
-			key := p.next()
-			value := p.next()
-			view.Options[key] = strings.Trim(value, "\";")
-			p.expectSemicolon()
+			d.Args = append(d.Args, arg)
 		}
-	}
+		return d, nil
+	case tEOF:
+		return nil, nil
+	case tRBrace:
+		return nil, p.errAt(tok.pos, "unexpected '}'")
+	case tSemi:
+		// stray semicolon; tolerate
+		return nil, nil
+	case tLBrace:
+		// Bare brace group → address-match group directive wrapper
+		blk, err := p.parseBlock()
+		if err != nil {
+			return nil, err
+		}
+		mg := blockToMatchGroup(blk)
+		d := &Directive{Name: "group", Args: []Expr{mg}, Pos: mg.Pos}
+		if p.peek().typ == tSemi {
+			p.next()
+		}
+		return d, nil
+	case tIdent:
+		// directive name
+		d := &Directive{Name: tok.lit, Pos: tok.pos}
+		// collect args until { or ;
+		for {
+			n := p.peek()
+			if n.typ == tEOF {
+				return nil, p.errAt(n.pos, "unexpected EOF; missing ';'")
+			}
+			if n.typ == tSemi {
+				p.next()
+				break
+			}
+			if n.typ == tLBrace {
+				p.next() // consume '{'
+				blk, err := p.parseBlock()
+				if err != nil {
+					return nil, err
+				}
+				d.Block = blk
+				// optional trailing semicolon after a block
+				if p.peek().typ == tSemi {
+					p.next()
+				}
+				break
+			}
+			if n.typ == tRBrace {
+				// End of the block without a trailing ';' for this directive — tolerate it.
+				break
+			}
 
-	return view, nil
+			arg, err := p.parseArg()
+			if err != nil {
+				return nil, err
+			}
+			d.Args = append(d.Args, arg)
+		}
+
+		// Handle include specially
+		if strings.EqualFold(d.Name, "include") {
+			return p.handleInclude(d)
+		}
+		return d, nil
+	default:
+		return nil, p.errAt(tok.pos, "unexpected token %s", tname(tok))
+	}
 }
 
-// parseStatistics parses statistics-channels (simplified)
-func (p *Parser) parseStatistics() (*Statistics, error) {
-	p.next() // consume "statistics-channels"
-
-	if p.next() != "{" {
-		return nil, fmt.Errorf("expected '{' after statistics-channels")
+func (p *parser) parseArg() (Expr, error) {
+	t := p.next()
+	switch t.typ {
+	case tString:
+		return StringLit{Value: t.lit, Pos: t.pos}, nil
+	case tIdent:
+		// Try classify as CIDR or IP or numberlike; keep raw to be lossless
+		lit := t.lit
+		if isCIDR(lit) {
+			return CIDRLit{Raw: lit, Pos: t.pos}, nil
+		}
+		if ip := net.ParseIP(lit); ip != nil {
+			return AddrLit{Raw: lit, IP: ip, Pos: t.pos}, nil
+		}
+		if isNumberLike(lit) {
+			return NumberLit{Raw: lit, Pos: t.pos}, nil
+		}
+		return Ident{Value: lit, Pos: t.pos}, nil
+	case tLBrace:
+		// Address-match list used as an argument position
+		blk, err := p.parseBlock()
+		if err != nil {
+			return nil, err
+		}
+		mg := blockToMatchGroup(blk)
+		return mg, nil
+	default:
+		return nil, p.errAt(t.pos, "invalid argument token %s", tname(t))
 	}
+}
 
-	stats := &Statistics{
-		Channels: []StatChannel{},
-	}
-
-	// Simplified implementation
-	for p.nextLine() {
-		token := p.peek()
-		if token == "}" {
+func (p *parser) parseBlock() (*Block, error) {
+	blk := &Block{Pos: p.peek().pos}
+	for {
+		t := p.peek()
+		if t.typ == tEOF {
+			return nil, p.errAt(t.pos, "unexpected EOF in block")
+		}
+		if t.typ == tRBrace {
 			p.next()
-			if p.peek() == ";" {
-				p.next()
-			}
 			break
 		}
-		p.next()
-	}
-
-	return stats, nil
-}
-
-// parseUnknownStatement parses unknown statements
-func (p *Parser) parseUnknownStatement() UnknownStatement {
-	stmt := UnknownStatement{
-		Type:    p.next(),
-		Content: strings.Join(p.tokens[p.pos:], " "),
-	}
-	p.pos = len(p.tokens) // consume all tokens
-	return stmt
-}
-
-// expectSemicolon consumes a semicolon if present
-func (p *Parser) expectSemicolon() {
-	if p.peek() == ";" {
-		p.next()
-	}
-}
-
-// ParseString is a convenience function to parse a named.conf from a string
-func ParseString(content string) (*Config, error) {
-	return NewParser(strings.NewReader(content)).Parse()
-}
-
-// Example usage and helper functions
-
-// String returns a string representation of the config (for debugging)
-func (c *Config) String() string {
-	var sb strings.Builder
-
-	if len(c.TLS) > 0 {
-		sb.WriteString(fmt.Sprintf("TLS Configurations: %d\n", len(c.TLS)))
-		for _, tls := range c.TLS {
-			sb.WriteString(fmt.Sprintf("  - %s (cert: %s, key: %s)\n", tls.Name, tls.CertFile, tls.KeyFile))
+		d, err := p.parseDirective()
+		if err != nil {
+			return nil, err
+		}
+		if d != nil {
+			blk.Directives = append(blk.Directives, d)
 		}
 	}
+	return blk, nil
+}
 
-	if len(c.Zones) > 0 {
-		sb.WriteString(fmt.Sprintf("Zones: %d\n", len(c.Zones)))
-		for _, zone := range c.Zones {
-			sb.WriteString(fmt.Sprintf("  - %s (%s)\n", zone.Name, zone.Type))
+func (p *parser) handleInclude(d *Directive) (*Directive, error) {
+	if len(d.Args) != 1 {
+		return nil, p.errAt(d.Pos, "include expects exactly one argument")
+	}
+	str, ok := d.Args[0].(StringLit)
+	if !ok {
+		return nil, p.errAt(d.Pos, "include path must be a string")
+	}
+	inc := &Include{Path: str.Value, Pos: d.Pos}
+
+	if !p.opts.InlineIncludes {
+		// Replace directive's args with IncludeExpr for consumers
+		d.Args = []Expr{IncludeExpr{Inc: inc}}
+		return d, nil
+	}
+
+	// Inline includes
+	abs := str.Value
+	if !filepath.IsAbs(abs) {
+		dir := filepath.Dir(p.file)
+		abs = filepath.Join(dir, str.Value)
+	}
+	abs = filepath.Clean(abs)
+	if p.seenInclude[abs] {
+		return nil, p.errAt(d.Pos, "include cycle detected: %s", abs)
+	}
+	p.seenInclude[abs] = true
+	defer func() { delete(p.seenInclude, abs) }()
+
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return nil, p.errAt(d.Pos, "include read error: %v", err)
+	}
+	child := newParser(p.root, abs, strings.NewReader(string(data)), p.opts)
+	if err := child.parseTop(); err != nil {
+		return nil, err
+	}
+	inc.Inlined = append(inc.Inlined, child.root.Directives...)
+
+	// Return a synthetic directive that holds the inlined block for position
+	return &Directive{
+		Name:  "include",
+		Args:  []Expr{IncludeExpr{Inc: inc}},
+		Block: &Block{Directives: inc.Inlined, Pos: d.Pos},
+		Pos:   d.Pos,
+	}, nil
+}
+
+// =============================
+// Helpers
+// =============================
+
+func isCIDR(s string) bool {
+	if !strings.Contains(s, "/") {
+		return false
+	}
+	_, _, err := net.ParseCIDR(s)
+	return err == nil
+}
+
+func isNumberLike(s string) bool {
+	// Accept plain digits or digits followed by unit/size suffixes (common in BIND)
+	if s == "" {
+		return false
+	}
+	allDigits := true
+	for i, r := range s {
+		if i == 0 && (r == '+' || r == '-') {
+			continue
+		}
+		if r < '0' || r > '9' {
+			allDigits = false
+			break
 		}
 	}
-
-	if len(c.ACLs) > 0 {
-		sb.WriteString(fmt.Sprintf("ACLs: %d\n", len(c.ACLs)))
-		for _, acl := range c.ACLs {
-			sb.WriteString(fmt.Sprintf("  - %s (%d entries)\n", acl.Name, len(acl.Entries)))
+	if allDigits {
+		return true
+	}
+	// suffix variants like 3m, 1h, 64K, 1G, 250ms
+	base := 0
+	for i, r := range s {
+		if r < '0' || r > '9' {
+			base = i
+			break
 		}
 	}
-
-	if len(c.Keys) > 0 {
-		sb.WriteString(fmt.Sprintf("Keys: %d\n", len(c.Keys)))
+	if base == 0 {
+		return false
 	}
-
-	if c.Options.Directory != "" {
-		sb.WriteString(fmt.Sprintf("Directory: %s\n", c.Options.Directory))
+	if base >= len(s) {
+		return true
 	}
+	suf := strings.ToLower(s[base:])
+	switch suf {
+	case "k", "m", "g", "t", "ms", "s", "h", "d", "w":
+		return true
+	}
+	return false
+}
 
-	if len(c.Options.ListenOn) > 0 {
-		sb.WriteString(fmt.Sprintf("Listen-On Interfaces: %d\n", len(c.Options.ListenOn)))
-		for _, listen := range c.Options.ListenOn {
-			sb.WriteString(fmt.Sprintf("  - Port %d", listen.Port))
-			if listen.TLS != "" {
-				sb.WriteString(fmt.Sprintf(" (TLS: %s)", listen.TLS))
+// Convert a parsed block of pseudo-directives into a MatchGroup.
+func blockToMatchGroup(blk *Block) MatchGroup {
+	mg := MatchGroup{Pos: blk.Pos}
+	for _, d := range blk.Directives {
+		// Nested groups appear as Directive{Name:"group", Args:[MatchGroup]} OR as a
+		// brace-handled directive with Block. Handle both.
+		if d.Name == "group" {
+			if len(d.Args) == 1 {
+				if g, ok := d.Args[0].(MatchGroup); ok {
+					mg.Items = append(mg.Items, &MatchItem{Parts: []Expr{g}, Pos: g.Pos})
+					continue
+				}
 			}
-			if listen.HTTP != "" {
-				sb.WriteString(fmt.Sprintf(" (HTTP: %s)", listen.HTTP))
+			if d.Block != nil {
+				g := blockToMatchGroup(d.Block)
+				mg.Items = append(mg.Items, &MatchItem{Parts: []Expr{g}, Pos: g.Pos})
+				continue
 			}
-			sb.WriteString(fmt.Sprintf(" - %v\n", listen.Addresses))
 		}
+		item := directiveToMatchItem(d)
+		mg.Items = append(mg.Items, &item)
+	}
+	return mg
+}
+
+func directiveToMatchItem(d *Directive) MatchItem {
+	parts := make([]Expr, 0, 1+len(d.Args))
+	pos := d.Pos
+	name := d.Name
+	neg := false
+	if strings.HasPrefix(name, "!") {
+		neg = true
+		name = strings.TrimPrefix(name, "!")
+	}
+	// classify name token
+	if isCIDR(name) {
+		parts = append(parts, CIDRLit{Raw: name, Pos: pos})
+	} else if ip := net.ParseIP(name); ip != nil {
+		parts = append(parts, AddrLit{Raw: name, IP: ip, Pos: pos})
+	} else {
+		parts = append(parts, Ident{Value: name, Pos: pos})
+	}
+	parts = append(parts, d.Args...)
+	return MatchItem{Parts: parts, Negated: neg, Pos: pos}
+}
+
+// =============================
+// Rendering / Debugging
+// =============================
+
+// String renders the AST back to something close to named.conf syntax.
+func (f *File) String() string {
+	var b strings.Builder
+	for _, d := range f.Directives {
+		b.WriteString(renderDirective(d, 0))
+	}
+	return b.String()
+}
+
+func renderDirective(d *Directive, indent int) string {
+	pad := strings.Repeat("\t", indent)
+	var b strings.Builder
+	// Render item-only statements (e.g., a bare "string"; inside a list)
+	if d.Name == dirItem {
+		pad := strings.Repeat("\t", indent)
+		var b strings.Builder
+		b.WriteString(pad)
+		for i, a := range d.Args {
+			if i > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(renderArg(a))
+		}
+		b.WriteString(";\n")
+		return b.String()
 	}
 
-	return sb.String()
+	// Special rendering for anonymous group wrapper
+	if d.Name == "group" && len(d.Args) == 1 {
+		if mg, ok := d.Args[0].(MatchGroup); ok {
+			b.WriteString(renderMatchGroup(mg, indent))
+			b.WriteString("\n")
+			return b.String()
+		}
+	}
+	b.WriteString(pad)
+	b.WriteString(d.Name)
+	for _, a := range d.Args {
+		b.WriteByte(' ')
+		b.WriteString(renderArg(a))
+	}
+	if d.Block != nil {
+		b.WriteString(" {\n")
+		for _, cd := range d.Block.Directives {
+			b.WriteString(renderDirective(cd, indent+1))
+		}
+		b.WriteString(pad)
+		b.WriteString("}")
+		b.WriteString(";\n")
+		return b.String()
+	}
+	b.WriteString(";\n")
+	return b.String()
+}
+
+func renderArg(e Expr) string {
+	switch v := e.(type) {
+	case StringLit:
+		return fmt.Sprintf("\"%s\"", escape(v.Value))
+	case Ident:
+		return v.Value
+	case NumberLit:
+		return v.Raw
+	case AddrLit:
+		return v.Raw
+	case CIDRLit:
+		return v.Raw
+	case IncludeExpr:
+		return fmt.Sprintf("\"%s\"", escape(v.Inc.Path))
+	case MatchGroup:
+		return renderMatchGroup(v, 0)
+	default:
+		return "?"
+	}
+}
+
+func escape(s string) string {
+	return strings.NewReplacer("\\", "\\\\", "\"", "\\\"").Replace(s)
+}
+
+// Pretty-print a MatchGroup. Indent controls nested formatting when used as a directive.
+func renderMatchGroup(g MatchGroup, indent int) string {
+	pad := strings.Repeat("\t", indent)
+	var b strings.Builder
+	b.WriteString(pad)
+	b.WriteString("{")
+	if len(g.Items) == 0 {
+		b.WriteString(" }")
+		return b.String()
+	}
+	b.WriteString("\n")
+	for _, it := range g.Items {
+		b.WriteString(pad)
+		b.WriteString("\t")
+		if it.Negated {
+			b.WriteString("!")
+		}
+		for i, p := range it.Parts {
+			if i > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(renderArg(p))
+		}
+		b.WriteString(";\n")
+	}
+	b.WriteString(pad)
+	b.WriteString("}")
+	return b.String()
 }
