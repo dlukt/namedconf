@@ -12,8 +12,7 @@ import (
     "net"
     "strings"
 
-    // adjust import if your parser lives in this same module
-    "your/module/namedconf"
+    "github.com/dlukt/namedconf"
 )
 
 type Zone struct {
