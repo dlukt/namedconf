@@ -43,38 +43,38 @@ const dirItem = "__item"
 type ParseOptions struct {
 	// If true, replace `include "file";` directives with the directives from the
 	// included file(s). Otherwise, Include nodes remain in the AST.
-	InlineIncludes bool
+	InlineIncludes bool `json:"inlineIncludes,omitempty"`
 	// A custom filesystem to read includes from. Defaults to the OS filesystem.
-	FS fs.FS
+	FS fs.FS `json:"fs,omitempty"`
 }
 
 // File represents a parsed named.conf file.
 type File struct {
-	Path       string
-	Directives []*Directive
+	Path       string       `json:"path,omitempty"`
+	Directives []*Directive `json:"directives,omitempty"`
 }
 
 // Directive models `name [args...] [ { block } ];`
 // Many BIND statements have this shape. Unknown statements are preserved.
 type Directive struct {
-	Name  string
-	Args  []Expr // raw tokens/atoms (quoted strings, idents, numbers, literals)
-	Block *Block // optional nested block
-	Pos   Position
+	Name  string   `json:"name,omitempty"`
+	Args  []Expr   `json:"args,omitempty"`  // raw tokens/atoms (quoted strings, idents, numbers, literals)
+	Block *Block   `json:"block,omitempty"` // optional nested block
+	Pos   Position `json:"pos,omitempty"`
 }
 
 // Block is a sequence of directives inside `{ ... }`.
 type Block struct {
-	Directives []*Directive
-	Pos        Position
+	Directives []*Directive `json:"directives,omitempty"`
+	Pos        Position     `json:"pos,omitempty"`
 }
 
 // Include is a special node for `include "path";`.
 type Include struct {
-	Path string
-	Pos  Position
-	// If InlineIncludes is true, Inlined holds parsed directives from Path.
-	Inlined []*Directive
+	Path string   `json:"path,omitempty"`
+	Pos  Position `json:"pos,omitempty"`
+	// If InlineIncludes is true, Inlined holds parsed directives from Path. `json:"inlined,omitempty"`
+	Inlined []*Directive `json:"inlined,omitempty"`
 }
 
 // Expr is any argument expression. For named.conf we keep it simple and lossless.
@@ -84,36 +84,39 @@ type Expr interface{ isExpr() }
 
 type (
 	Ident struct {
-		Value string
-		Pos   Position
+		Value string   `json:"value,omitempty"`
+		Pos   Position `json:"pos,omitempty"`
 	}
 	StringLit struct {
-		Value string
-		Pos   Position
+		Value string   `json:"value,omitempty"`
+		Pos   Position `json:"pos,omitempty"`
 	}
 	NumberLit struct {
-		Raw string
-		Pos Position
+		Raw string   `json:"raw,omitempty"`
+		Pos Position `json:"pos,omitempty"`
 	} // e.g., 53, 3m, 1G
 	AddrLit struct {
-		Raw string
-		IP  net.IP
-		Pos Position
+		Raw string   `json:"raw,omitempty"`
+		IP  net.IP   `json:"ip,omitempty"`
+		Pos Position `json:"pos,omitempty"`
 	} // IPv4/IPv6 as a single token
 	CIDRLit struct {
-		Raw string
-		Pos Position
+		Raw string   `json:"raw,omitempty"`
+		Pos Position `json:"pos,omitempty"`
 	} // e.g., 10.0.0.0/8, 2001:db8::/32
-	IncludeExpr struct{ Inc *Include } // used as an argument positionally if needed
+	IncludeExpr struct {
+		Inc *Include `json:"inc,omitempty"`
+	} // used as an argument positionally if needed
+
 	// First-class address-match group: { item; item; { nested; }; }
 	MatchGroup struct {
-		Items []*MatchItem
-		Pos   Position
+		Items []*MatchItem `json:"items,omitempty"`
+		Pos   Position     `json:"pos,omitempty"`
 	}
 	MatchItem struct {
-		Parts   []Expr
-		Negated bool
-		Pos     Position
+		Parts   []Expr   `json:"parts,omitempty"`
+		Negated bool     `json:"negated,omitempty"`
+		Pos     Position `json:"pos,omitempty"`
 	}
 )
 
@@ -127,9 +130,9 @@ func (MatchGroup) isExpr()  {}
 
 // Position identifies a source location.
 type Position struct {
-	File string
-	Line int
-	Col  int
+	File string `json:"file,omitempty"`
+	Line int    `json:"line,omitempty"`
+	Col  int    `json:"col,omitempty"`
 }
 
 func (p Position) String() string {
